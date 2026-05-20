@@ -7,6 +7,18 @@
 
 > A professional-grade desktop application for predicting football match outcomes using an ensemble machine learning model — achieving **65% accuracy** vs a 50% random baseline.
 
+## 🚀 Live Demo
+
+![Football Predictor Pro Demo](https://via.placeholder.com/1200x600.png?text=Football+Predictor+Pro+UI+Demo)
+
+Run the web API locally:
+```bash
+pip install fastapi uvicorn
+python web_app.py
+```
+
+Then open http://localhost:8000 in your browser!
+
 ## Results
 
 | Metric | Value |
