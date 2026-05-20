@@ -35,6 +35,10 @@ class DataService:
         
         return query.order_by(Match.date).limit(limit).all()
     
+    def get_leagues(self) -> List[League]:
+        """Get all available leagues."""
+        return self.session.query(League).order_by(League.name).all()
+    
     def get_recent_matches(self, limit: int = 10, league_id: Optional[int] = None) -> List[Match]:
         """
         Get recent finished matches.

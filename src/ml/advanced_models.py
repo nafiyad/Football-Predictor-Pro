@@ -15,10 +15,19 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 import pickle
 import os
+from datetime import datetime
 from utils.config import Config
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+# Try to import Optuna for Bayesian hyperparameter tuning
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
 
 
 class AdvancedModelTrainer:
@@ -292,6 +301,68 @@ class AdvancedModelTrainer:
             pickle.dump(self.scaler, f)
         
         logger.info(f"Saved scaler to {filepath}")
+    
+    def create_calibrated_classifier(self, base_model, method='sigmoid', cv=5):
+        """Create calibrated classifier for reliable probability outputs."""
+        logger.info(f"Creating calibrated classifier using {method} method...")
+        
+        calibrated_model = CalibratedClassifierCV(
+            estimator=base_model,
+            method=method,
+            cv=cv
+        )
+        
+        return calibrated_model
+    
+    def optuna_optimize(self, X_train, y_train, n_trials=50, timeout=300):
+        """Bayesian hyperparameter tuning using Optuna."""
+        if not OPTUNA_AVAILABLE:
+            logger.warning("Optuna not available. Falling back to GridSearchCV.")
+            return None, None
+        
+        logger.info(f"Starting Optuna optimization with {n_trials} trials...")
+        
+        def objective(trial):
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 500),
+                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            }
+            
+            model = XGBClassifier(**params, random_state=42, n_jobs=-1, eval_metric='mlogloss')
+            scores = cross_val_score(model, X_train, y_train, cv=3, scoring='accuracy', n_jobs=-1)
+            return scores.mean()
+        
+        sampler = TPESampler(seed=42)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
+        study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
+        
+        logger.info(f"Best trial: {study.best_trial.value:.4f}")
+        logger.info(f"Best params: {study.best_params}")
+        
+        best_model = XGBClassifier(**study.best_params, random_state=42, n_jobs=-1, eval_metric='mlogloss')
+        return best_model, study
+    
+    def save_model_versioned(self, model, model_name: str):
+        """Save model with timestamp for versioning."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        versioned_name = f"{model_name}_{timestamp}"
+        
+        filepath = os.path.join(Config.ML_MODELS_DIR, f"{versioned_name}.pkl")
+        with open(filepath, 'wb') as f:
+            pickle.dump(model, f)
+        
+        logger.info(f"Saved versioned model: {versioned_name}")
+        
+        latest_filepath = os.path.join(Config.ML_MODELS_DIR, f"{model_name}.pkl")
+        with open(latest_filepath, 'wb') as f:
+            pickle.dump(model, f)
+        
+        logger.info(f"Saved latest model: {model_name}")
+        return versioned_name
 
 
 class EnsemblePredictor:

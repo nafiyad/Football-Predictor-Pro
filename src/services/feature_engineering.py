@@ -1,7 +1,7 @@
 """Feature engineering for ML models."""
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from sqlalchemy.orm import Session
 from models.database import Match, MatchStats, Team
 from database.connection import get_session
@@ -11,11 +11,146 @@ from utils.config import Config
 class FeatureEngineer:
     """Feature engineering service for match predictions."""
     
+    # Elo rating constants
+    ELO_K_FACTOR = 32
+    ELO_INITIAL_RATING = 1500
+    ELO_HOME_ADVANTAGE = 100
+    
     def __init__(self, session: Optional[Session] = None):
         """Initialize feature engineer."""
         self.session = session or get_session()
         self.form_window = Config.FORM_WINDOW
         self.h2h_window = Config.H2H_WINDOW
+        self._elo_cache: Dict[Tuple[int, datetime], float] = {}
+    
+    def get_elo_rating(self, team_id: int, date: datetime) -> float:
+        """Get Elo rating for a team at a specific date."""
+        cache_key = (team_id, date.date() if isinstance(date, datetime) else date)
+        if cache_key in self._elo_cache:
+            return self._elo_cache[cache_key]
+        
+        matches = self.session.query(Match).filter(
+            Match.status == 'finished',
+            Match.date < date,
+            ((Match.home_team_id == team_id) | (Match.away_team_id == team_id))
+        ).order_by(Match.date).all()
+        
+        if not matches:
+            self._elo_cache[cache_key] = self.ELO_INITIAL_RATING
+            return self.ELO_INITIAL_RATING
+        
+        rating = self.ELO_INITIAL_RATING
+        for match in matches:
+            is_home = match.home_team_id == team_id
+            our_goals = match.home_goals if is_home else match.away_goals
+            opp_goals = match.away_goals if is_home else match.home_goals
+            
+            expected = 1 / (1 + 10 ** ((rating - self.ELO_INITIAL_RATING) / 400))
+            actual = 1.0 if our_goals > opp_goals else 0.5 if our_goals == opp_goals else 0.0
+            rating += self.ELO_K_FACTOR * (actual - expected)
+        
+        self._elo_cache[cache_key] = rating
+        return rating
+    
+    def get_referee_tendencies(self, referee: Optional[str], before_date: datetime) -> np.ndarray:
+        """Get referee tendency features."""
+        if not referee:
+            return np.zeros(5)
+        
+        matches = self.session.query(Match).filter(
+            Match.referee == referee,
+            Match.status == 'finished',
+            Match.date < before_date
+        ).limit(20).all()
+        
+        if len(matches) < 3:
+            return np.zeros(5)
+        
+        home_wins = draws = away_wins = total_goals = 0
+        for match in matches:
+            if match.home_goals > match.away_goals:
+                home_wins += 1
+            elif match.home_goals == match.away_goals:
+                draws += 1
+            else:
+                away_wins += 1
+            total_goals += match.home_goals + match.away_goals
+        
+        n = len(matches)
+        return np.array([home_wins/n, draws/n, away_wins/n, 0, total_goals/n])
+    
+    def get_h2h_streak(self, home_team_id: int, away_team_id: int, before_date: datetime) -> int:
+        """Get head-to-head streak."""
+        matches = self.session.query(Match).filter(
+            ((Match.home_team_id == home_team_id) & (Match.away_team_id == away_team_id)) |
+            ((Match.home_team_id == away_team_id) & (Match.away_team_id == home_team_id)),
+            Match.status == 'finished',
+            Match.date < before_date
+        ).order_by(Match.date.desc()).limit(5).all()
+        
+        if not matches:
+            return 0
+        
+        streak = 0
+        for match in matches:
+            if match.home_team_id == home_team_id:
+                if match.home_goals > match.away_goals:
+                    streak += 1
+                elif match.home_goals < match.away_goals:
+                    streak -= 1
+            else:
+                if match.away_goals > match.home_goals:
+                    streak += 1
+                elif match.away_goals < match.home_goals:
+                    streak -= 1
+        return streak
+    
+    def get_home_away_form_last5(self, team_id: int, venue: str, before_date: datetime) -> np.ndarray:
+        """Get form over last 5 home or away matches."""
+        query = self.session.query(Match).filter(
+            Match.status == 'finished',
+            Match.date < before_date
+        )
+        
+        if venue == 'home':
+            query = query.filter(Match.home_team_id == team_id)
+        else:
+            query = query.filter(Match.away_team_id == team_id)
+        
+        matches = query.order_by(Match.date.desc()).limit(5).all()
+        
+        if not matches:
+            return np.zeros(6)
+        
+        points = wins = draws = losses = goals_scored = goals_conceded = 0
+        
+        for match in matches:
+            is_home = match.home_team_id == team_id
+            if is_home:
+                goals_scored += match.home_goals
+                goals_conceded += match.away_goals
+                if match.home_goals > match.away_goals:
+                    wins += 1
+                    points += 3
+                elif match.home_goals == match.away_goals:
+                    draws += 1
+                    points += 1
+                else:
+                    losses += 1
+            else:
+                goals_scored += match.away_goals
+                goals_conceded += match.home_goals
+                if match.away_goals > match.home_goals:
+                    wins += 1
+                    points += 3
+                elif match.away_goals == match.home_goals:
+                    draws += 1
+                    points += 1
+                else:
+                    losses += 1
+        
+        n = len(matches)
+        return np.array([points/n, wins/n, draws/n, losses/n, goals_scored/n, goals_conceded/n])
     
     def engineer_match_features(self, match_id: int) -> np.ndarray:
         """
@@ -39,8 +174,34 @@ class FeatureEngineer:
         # Get head-to-head features
         h2h_features = self.get_h2h_features(match.home_team_id, match.away_team_id, before_date=match.date)
         
-        # Combine all features
-        features = np.concatenate([home_features, away_features, h2h_features])
+        # Get new Elo rating features
+        elo_home = self.get_elo_rating(match.home_team_id, match.date)
+        elo_away = self.get_elo_rating(match.away_team_id, match.date)
+        elo_diff = (elo_home + self.ELO_HOME_ADVANTAGE) - elo_away
+        elo_features = np.array([elo_home / 2000, elo_away / 2000, elo_diff / 400])
+        
+        # Get H2H streak
+        h2h_streak = self.get_h2h_streak(match.home_team_id, match.away_team_id, match.date)
+        h2h_streak_array = np.array([h2h_streak / 5.0])
+        
+        # Home/away form last 5
+        home_form = self.get_home_away_form_last5(match.home_team_id, 'home', match.date)
+        away_form = self.get_home_away_form_last5(match.away_team_id, 'away', match.date)
+        
+        # Referee tendencies
+        referee_features = self.get_referee_tendencies(match.referee, match.date)
+        
+        # Combine all features (extend from 25 to ~46 features)
+        features = np.concatenate([
+            home_features, 
+            away_features, 
+            h2h_features,
+            elo_features,
+            h2h_streak_array,
+            home_form,
+            away_form,
+            referee_features
+        ])
         
         return features
     

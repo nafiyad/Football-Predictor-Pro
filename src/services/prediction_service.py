@@ -17,19 +17,23 @@ logger = setup_logger(__name__)
 class PredictionService:
     """Service for making match predictions using ensemble ML models."""
     
-    def __init__(self, session: Optional[Session] = None):
+    def __init__(self, session: Optional[Session] = None, league_id: Optional[int] = None):
         """Initialize prediction service."""
         self.session = session or get_session()
         self.feature_engineer = FeatureEngineer(self.session)
         self.models_loaded = False
         self.models = {}
+        self.league_id = league_id
         
-        # Try to load models
         try:
             self.load_models()
         except Exception as e:
             logger.warning(f"Could not load ML models: {e}")
             logger.info("Models will need to be trained first.")
+    
+    def set_league_filter(self, league_id: Optional[int]):
+        """Set league filter for predictions."""
+        self.league_id = league_id
     
     def load_models(self):
         """Load trained ML models."""
@@ -76,9 +80,15 @@ class PredictionService:
             if existing:
                 return existing
         
-        # Check if models are loaded
+        # Check if match exists
+        match = self.session.query(Match).filter_by(id=match_id).first()
+        if not match:
+            logger.error(f"Match {match_id} not found")
+            return None
+        
+        # Check if models are loaded - use heuristic fallback if not
         if not self.models_loaded:
-            logger.error("Models not loaded. Cannot generate prediction.")
+            logger.warning("Models not loaded. Using heuristic prediction.")
             return self._create_dummy_prediction(match_id)
         
         try:
